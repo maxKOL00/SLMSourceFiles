@@ -74,27 +74,27 @@ ImageProcessing::ImageProcessing(const Parameters& params) {
 
 }
 
-
-std::vector<size_t> ImageProcessing::create_mask(
+std::vector<unsigned int> ImageProcessing::create_mask(
 	const byte* image_data,
-	size_t width, size_t height,
-	size_t num_peaks_x, size_t num_peaks_y
+	unsigned int width, unsigned int height,
+	unsigned int num_peaks_x, unsigned int num_peaks_y
 ) const {
-	const size_t num_peaks_tot = num_peaks_x * num_peaks_y;
+	const auto num_peaks_tot = num_peaks_x * num_peaks_y;
 
 	std::vector<double> image_data_smoothed(width * height);
 
 	// Move hardcoded values to ctor or so
 	math_utils::gaussian_filter(
-		image_data_smoothed.data(), image_data, width, height,
+		image_data_smoothed.data(), image_data, int(width), int(height),
 		11, 2
 	);
+
 	const double max_value = *std::max_element(image_data_smoothed.cbegin(), image_data_smoothed.cend());
 
 	auto peaks = math_utils::find_peaks2d(
 		image_data_smoothed.cbegin(), image_data_smoothed.cend(),
 		width,
-		max_value / 3.5
+		max_value / 2
 	);
 
 
@@ -102,7 +102,7 @@ std::vector<size_t> ImageProcessing::create_mask(
 		std::stringstream error_message;
 		error_message << "Wrong number of peaks detected, ";
 		error_message << peaks.size() << " instead of " << num_peaks_tot;
-		errBox(error_message.str(), __FILE__, __LINE__);
+		errBox(error_message.str().c_str(), __FILE__, __LINE__);
 		throw std::length_error(error_message.str());
 	}
 
@@ -113,7 +113,6 @@ std::vector<size_t> ImageProcessing::create_mask(
 
 	return peaks;
 };
-
 
 void ImageProcessing::shift_fourier_image(
 	byte* phasemap, 

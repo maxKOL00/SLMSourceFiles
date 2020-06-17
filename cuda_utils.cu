@@ -47,10 +47,10 @@ namespace cuda_utils {
 
 
         bool center_site = (first_nonzero_index <= x)
-                        && (x < first_nonzero_index + N)
-                        && (first_nonzero_index <= y)
-                        && (y < first_nonzero_index + N);
-                            
+            && (x < first_nonzero_index + N)
+            && (first_nonzero_index <= y)
+            && (y < first_nonzero_index + N);
+
 
         if (center_site) {
             x_unpadded = x - first_nonzero_index;
@@ -77,50 +77,6 @@ namespace cuda_utils {
         arr_shifted[y_new * N_x + x_new] = arr_unshifted[y * N_x + x];
     }
 
-    //__global__ void fresnel_propagator_rad(
-    //    cufftDoubleComplex* dst,
-    //    double delta_z_px,
-    //    unsigned int number_of_pixels_padded,
-    //    unsigned int number_of_pixels_unpadded,
-    //    double focal_length_px, 
-    //    double wavelength_px
-    //) {
-    //    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
-    //    
-    //    const int x = tid % number_of_pixels_padded;
-    //    const int y = tid / number_of_pixels_padded;
-    //    
-    //    const int x_rel = int(x - number_of_pixels_padded / 2);
-    //    const int y_rel = int(y - number_of_pixels_padded / 2);
-
-
-    //    if (math_utils::is_in_circle(x_rel, y_rel, 0, 0, number_of_pixels_unpadded / 2)) {
-
-    //        // lens(-z) is not - lens(z) therefore the phase is substracted if delta_z < 0
-
-    //        double sign = (delta_z_px < 0) ? -1.0: 1.0;
-    //        delta_z_px = sign * delta_z_px;
-
-    //        //double phase_rad =
-    //        //    math_utils::PI() / wavelength_px * (1.0 / (focal_length_px + delta_z_px) - 1.0 / focal_length_px)
-    //        //    * (pow(double(x_rel), 2.0) + pow(double(y_rel), 2.0));
-    //            
-    //        double phase_rad =
-    //            math_utils::PI() / wavelength_px * (delta_z_px / pow(focal_length_px, 2.0))
-    //            * (pow(double(x_rel), 2.0) + pow(double(y_rel), 2.0));
-
-    //        // phase_rad = fmod(phase_rad, 2 * math_utils::PI());
-
-    //        const double re = 1.0 / sqrt(2.0) * cos(sign * phase_rad);
-    //        const double im = 1.0 / sqrt(2.0) * sin(sign * phase_rad);
-    //                    
-    //        const double re_prev = dst[tid].x;
-    //        const double im_prev = dst[tid].y;
-
-    //        dst[tid].x = (re * re_prev - im * im_prev);
-    //        dst[tid].y = (re * im_prev + im * re_prev);
-    //    }
-    //}
 
     __global__ void multiply_by_quadratic_phase_factor(
         cufftDoubleComplex* dst,
@@ -128,24 +84,20 @@ namespace cuda_utils {
         double c
     ) {
         const auto tid = blockDim.x * blockIdx.x + threadIdx.x;
-            
-        const int x = tid % number_of_pixels_padded;
-        const int y = tid / number_of_pixels_padded;
-            
-        const auto x_rel = x - int(number_of_pixels_padded) / 2;
-        const auto y_rel = y - int(number_of_pixels_padded) / 2;
 
-        const double phase_rad = c * (x_rel * x_rel + y_rel * y_rel);
+        const int x_index = tid % number_of_pixels_padded;
+        const int y_index = tid / number_of_pixels_padded;
 
+        const auto x_rel = x_index - int(number_of_pixels_padded) / 2;
+        const auto y_rel = y_index - int(number_of_pixels_padded) / 2;
 
-        const double re = 1.0 / sqrt(2.0) * cos(phase_rad);
-        const double im = 1.0 / sqrt(2.0) * sin(phase_rad);
-                            
-        const double re_prev = dst[tid].x;
-        const double im_prev = dst[tid].y;
+        const double phase_rad = c * (double)(x_rel * x_rel + y_rel * y_rel);
 
-        dst[tid].x = (re * re_prev - im * im_prev);
-        dst[tid].y = (re * im_prev + im * re_prev);
+        double new_phase = math_utils::phase(dst[tid]) + phase_rad;
+        double amp = math_utils::amplitude(dst[tid]);
+
+        dst[tid].x = amp * cos(new_phase);
+        dst[tid].y = amp * sin(new_phase);
     }
 
     __global__ void shifted_intensity_distribution(
@@ -220,28 +172,18 @@ namespace cuda_utils {
         dst[tid].y *= scale_factor;
     }
 
-    __global__ void add_phase(
+    __global__ void substitute_phase(
         cufftDoubleComplex* __restrict dst,
-        const double* __restrict src,
-        unsigned int number_of_pixels_padded
+        const double* __restrict src
     ) {
         const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
-        const int x = tid % number_of_pixels_padded;
-        const int y = tid / number_of_pixels_padded;
-
         const double phase_rad = src[tid];
 
-        const double re = 1.0 / sqrt(2.0) * cos(phase_rad);
-        const double im = 1.0 / sqrt(2.0) * sin(phase_rad);
+        const double amp = math_utils::amplitude(dst[tid]);
 
-        const double re_prev = dst[tid].x;
-        const double im_prev = dst[tid].y;
-
-        dst[tid].x = (re * re_prev - im * im_prev);
-        dst[tid].y = (re * im_prev + im * re_prev);
-
-
+        dst[tid].x = amp * cos(phase_rad);
+        dst[tid].y = amp * cos(phase_rad);
     }
 
     double get_norm(
@@ -251,7 +193,7 @@ namespace cuda_utils {
         double total = 0.0;
         std::for_each(src, src + size, [&total](const auto& c) {
             total += math_utils::intensity(c);
-        });
+                      });
         return total;
     }
 
@@ -269,7 +211,8 @@ namespace cuda_utils {
         const unsigned int x_new = math_utils::mod(width - x_old, width);
         const unsigned int y_new = math_utils::mod(height - y_old, height);
 
-        dst[y_new * width + x_new] = src[y_old * width + x_old];
+        dst[y_new * width + x_new].x = src[y_old * width + x_old].x;
+        dst[y_new * width + x_new].y = src[y_old * width + x_old].y;
     }
 
     void save_phasemap(

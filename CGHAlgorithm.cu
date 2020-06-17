@@ -1,22 +1,36 @@
 #include "CGHAlgorithm.cuh"
-#include <chrono>
-#include <sstream>
 #include "errorMessage.h"
 //created by Felix Ronchen
 
-
-static __global__ void update_slm_plane_array(
-    cufftDoubleComplex* __restrict padded_array,
-    const cufftDoubleComplex* __restrict unpadded_array,
-    size_t number_of_pixels_padded, size_t NUMBER_OF_PIXELS_UNPADDED
+static __global__ void substitute_amplitudes_d(
+    cufftDoubleComplex* __restrict padded_amps_dst,
+    const double* __restrict unpadded_amps_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
 );
 
+static __global__ void substitute_phases_d(
+    cufftDoubleComplex* __restrict padded_phases_dst,
+    const double* __restrict unpadded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+);
 
-static_assert(
-    math_utils::is_power_of_two(NUMBER_OF_PIXELS_PADDED),
-    "Padded 1D size must be a power of 2"
-    );
+static __global__ void extract_amplitudes_d(
+    double* __restrict unpadded_amps_dst,
+    const cufftDoubleComplex* __restrict padded_amps_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+);
 
+static __global__ void extract_phases_d(
+    double* __restrict unpadded_phases_dst,
+    const cufftDoubleComplex* __restrict padded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius, bool add
+);
+
+static __global__ void extract_phases_to_grayscale_d(
+    byte* __restrict unpadded_phases_dst,
+    const cufftDoubleComplex* __restrict padded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+);
 
 CGHAlgorithm::CGHAlgorithm(
     const Parameters& params, statusBox* box
@@ -29,10 +43,17 @@ CGHAlgorithm::CGHAlgorithm(
     fixed_phase_limit_iterations(params.get_fixed_phase_limit_iterations()),
     fixed_phase_limit_nonuniformity(params.get_fixed_phase_limit_nonuniformity_percent() / 100.0),
     weighting_parameter(params.get_weighting_parameter()),
-    first_nonzero_index((NUMBER_OF_PIXELS_PADDED - NUMBER_OF_PIXELS_UNPADDED) / 2)
+    random_seed(params.get_random_seed()),
+    number_of_pixels_padded(params.get_number_of_pixels_padded()),
+    number_of_pixels_unpadded(params.get_number_of_pixels_unpadded()),
+    block_size(params.get_block_size()),
+    num_blocks_padded(params.get_num_blocks_padded()),
+    first_nonzero_index(params.get_first_nonzero_index())
 {
     init_cuda();
+
     editA = box;
+
     const auto beam_waist_x_mm = params.get_beam_waist_x_mm();
     const auto beam_waist_y_mm = params.get_beam_waist_y_mm();
 
@@ -46,25 +67,23 @@ void CGHAlgorithm::init_cuda(
     // Not sure if it needs to be synchronized after every allocation
     //My experience is that once after all allocatons is fine ^^ - Max
     // because of e.g. overlapping memory region
-    if (cudaSuccess != cudaMallocManaged(&beam_amplitudes, NUMBER_OF_PIXELS_UNPADDED * NUMBER_OF_PIXELS_UNPADDED * sizeof(cufftDoubleComplex))) {
+    if (cudaSuccess != cudaMallocManaged(&beam_amplitudes, number_of_pixels_unpadded * number_of_pixels_unpadded * sizeof(double))) {
         errBox("init_cuda: Could not allocate input_array", __FILE__, __LINE__);
         throw std::runtime_error("init_cuda: Could not allocate input_array");
     }
-    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
-    if (cudaSuccess != cudaMallocManaged(&slm_plane, NUMBER_OF_PIXELS_PADDED * NUMBER_OF_PIXELS_PADDED * sizeof(cufftDoubleComplex))) {
+    if (cudaSuccess != cudaMallocManaged(&slm_plane, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
         errBox("init_cuda: Could not allocate in", __FILE__, __LINE__);
         throw std::runtime_error("init_cuda: Could not allocate in");
     }
-    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
-    if (cudaSuccess != cudaMallocManaged(&image_plane, NUMBER_OF_PIXELS_PADDED * NUMBER_OF_PIXELS_PADDED * sizeof(cufftDoubleComplex))) {
+    if (cudaSuccess != cudaMallocManaged(&image_plane, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
         errBox("init_cuda: Could not allocate out array", __FILE__, __LINE__);
         throw std::runtime_error("init_cuda: Could not allocate out array");
     }
-    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
-    if (CUFFT_SUCCESS != cufftPlan2d(&fft_plan, (int)NUMBER_OF_PIXELS_PADDED, (int)NUMBER_OF_PIXELS_PADDED, CUFFT_Z2Z)) {
+
+    if (CUFFT_SUCCESS != cufftPlan2d(&fft_plan, (int)number_of_pixels_padded, (int)number_of_pixels_padded, CUFFT_Z2Z)) {
         errBox("CGHAlgorithm: Could not setup FFT plan", __FILE__, __LINE__);
         throw std::runtime_error("CGHAlgorithm: Could not setup FFT plan");
     }
@@ -94,60 +113,52 @@ void CGHAlgorithm::generate_beam_amplitude_array(
     const double sigma_x = sigma_x_mm / slm_pixel_size_mm / sqrt(2.);
     const double sigma_y = sigma_y_mm / slm_pixel_size_mm / sqrt(2.);
 
-    constexpr double phase = math_utils::PI() / 4.0;
     double total = 0.0;
     double amp;
-    long long center = NUMBER_OF_PIXELS_UNPADDED / 2;
-    for (int i = 0; i < (int)NUMBER_OF_PIXELS_UNPADDED; i++) {
-        for (int j = 0; j < (int)NUMBER_OF_PIXELS_UNPADDED; j++) {
-            //the radius has length=center so beam spans whole unpadded size
-            if (math_utils::is_in_circle(j, i, center, center, center)) {
+
+    for (int i = 0; i < (int)number_of_pixels_unpadded; i++) {
+        for (int j = 0; j < (int)number_of_pixels_unpadded; j++) {
+
+            if (math_utils::is_in_circle(j, i, number_of_pixels_unpadded / 2, number_of_pixels_unpadded / 2, number_of_pixels_unpadded / 2)) {
                 amp = math_utils::gaussian2d(
                     // Explicit conversion prevents compiler warnings
                     (double)j, (double)i,
-                    (double)NUMBER_OF_PIXELS_UNPADDED / 2.0, (double)NUMBER_OF_PIXELS_UNPADDED / 2.0,
+                    (double)number_of_pixels_unpadded / 2.0, (double)number_of_pixels_unpadded / 2.0,
                     sigma_x, sigma_y
                 );
-                beam_amplitudes[i * NUMBER_OF_PIXELS_UNPADDED + j].x = amp * cos(phase);
-                beam_amplitudes[i * NUMBER_OF_PIXELS_UNPADDED + j].y = amp * sin(phase);
+                beam_amplitudes[i * number_of_pixels_unpadded + j] = amp;
             }
             else {
-                beam_amplitudes[i * NUMBER_OF_PIXELS_UNPADDED + j].x = 0.;
-                beam_amplitudes[i * NUMBER_OF_PIXELS_UNPADDED + j].y = 0.;
+                beam_amplitudes[i * number_of_pixels_unpadded + j] = 0.;
             }
-            total += math_utils::intensity(beam_amplitudes[i * NUMBER_OF_PIXELS_UNPADDED + j]);
+            total += math_utils::intensity(beam_amplitudes[i * number_of_pixels_unpadded + j]);
         }
     }
     // Normalize again
-    long end = NUMBER_OF_PIXELS_UNPADDED * NUMBER_OF_PIXELS_UNPADDED;
-    for (size_t i = 0; i < end; i++) {
-        beam_amplitudes[i].x /= sqrt(total);
-        beam_amplitudes[i].y /= sqrt(total);
+    for (size_t i = 0; i < number_of_pixels_unpadded * number_of_pixels_unpadded; i++) {
+        beam_amplitudes[i] /= sqrt(total);
     }
 }
-
 
 std::vector<double> CGHAlgorithm::AWGS2D_loop(
     TweezerArray& tweezer_array,
     byte* phasemap_out
 ) {
-    int seed = std::chrono::system_clock::now().time_since_epoch().count();
-    const auto random_vec = generate_random_phase_distribution(seed);
-    //I changed to time seed. -Max (old seed was 1).
+    const auto random_vec = generate_random_phase_distribution(random_seed);
 
-    std::vector<double> non_uniformity_vec;//stores deviation from average trap intensity
+    std::vector<double> non_uniformity_vec;
 
-    bool fix_phase = false; // since we aren't doing camera feedback from Englund paper yet
+    bool fix_phase = false;
 
     set_initial_phase_distribution(random_vec.data());
     //writes upadded SLM_plane with random phase and 1/sqrt(2) amplitude
 
-    size_t iteration = 0;
+    unsigned int iteration = 0;
     for (;;) {
 
         // 1. Replace with input field (add gaussian beam)
-        update_slm_plane_array << <NUM_BLOCKS_PADDED, BLOCK_SIZE >> >
-            (slm_plane, beam_amplitudes, NUMBER_OF_PIXELS_PADDED, NUMBER_OF_PIXELS_UNPADDED);
+        substitute_amplitudes_d << <num_blocks_padded, block_size >> >
+            (slm_plane, beam_amplitudes, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
         cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
         // 2. Execute FFT
@@ -163,13 +174,12 @@ std::vector<double> CGHAlgorithm::AWGS2D_loop(
 
         // 3.1 Determine non-uniformity
         const double delta = tweezer_array.get_nonuniformity();
-        const double mean_intensity = tweezer_array.get_mean_intensity();
         non_uniformity_vec.push_back(delta);
 
         // Check if goal/bounds are reached
         if ((delta < max_nonuniformity) && (iteration > 3)) {
 
-            editA->appendMessage("Reached required unifprmity");
+            editA->appendMessage("Reached required uniformity");
             std::cout << "\nReached required uniformity\n";
             break;
         }
@@ -183,6 +193,7 @@ std::vector<double> CGHAlgorithm::AWGS2D_loop(
         // Not sure if this if is needed but sometimes the first iteration is very uniform
         // but uniformly bad
         const auto intensities = tweezer_array.get_intensities();
+        const double mean_intensity = tweezer_array.get_mean_intensity();
         const auto weights = calculate_weights(intensities, mean_intensity);
 
         tweezer_array.update_target_intensities(weights);
@@ -190,7 +201,7 @@ std::vector<double> CGHAlgorithm::AWGS2D_loop(
 
         // 3.3 Reset whole out array (all zeros)
         if (cudaSuccess != cudaMemset(image_plane, 0,
-            NUMBER_OF_PIXELS_PADDED * NUMBER_OF_PIXELS_PADDED * sizeof(cufftDoubleComplex))) {
+            number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
             errBox("AWGS2D_loop: Could not set out array to 0", __FILE__, __LINE__);
             throw std::runtime_error("AWGS2D_loop: Could not set out array to 0");
         }
@@ -233,7 +244,9 @@ std::vector<double> CGHAlgorithm::AWGS2D_loop(
     }
 
     // Fill result in phasemap array so it can be processed in main
-    extract_final_phasemap(phasemap_out);
+    extract_phases_to_grayscale_d << <num_blocks_padded, block_size >> >
+        (phasemap_out, slm_plane, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
+    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
     return non_uniformity_vec;
 }
@@ -247,8 +260,8 @@ double CGHAlgorithm::AWGS2D_camera_feedback_iteration(
     set_initial_phase_distribution(phasemap_out);
 
     // 1. Replace with input field
-    update_slm_plane_array << <NUM_BLOCKS_PADDED, BLOCK_SIZE >> >
-        (slm_plane, beam_amplitudes, NUMBER_OF_PIXELS_PADDED, NUMBER_OF_PIXELS_UNPADDED);
+    substitute_amplitudes_d << <num_blocks_padded, block_size >> >
+        (slm_plane, beam_amplitudes, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
     cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
     // 2. Execute FFT
@@ -278,7 +291,7 @@ double CGHAlgorithm::AWGS2D_camera_feedback_iteration(
 
     // 3.3 Reset whole out array
     if (cudaSuccess != cudaMemset(image_plane, 0,
-        NUMBER_OF_PIXELS_PADDED * NUMBER_OF_PIXELS_PADDED * sizeof(cufftDoubleComplex))) {
+        number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
         errBox("AWGS2D_camera_feedback_iteration: Could not set out array to 0", __FILE__, __LINE__);
         throw std::runtime_error("AWGS2D_camera_feedback_iteration: Could not set out array to 0");
     }
@@ -291,32 +304,189 @@ double CGHAlgorithm::AWGS2D_camera_feedback_iteration(
     cufftExecZ2Z(fft_plan, image_plane, slm_plane, CUFFT_INVERSE);
     cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
-    extract_final_phasemap(phasemap_out);
+    extract_phases_to_grayscale_d << <num_blocks_padded, block_size >> >
+        (phasemap_out, slm_plane, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
+    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
     return non_uniformity;
+}
+
+std::vector<double> CGHAlgorithm::AWGS3D_loop(
+    std::vector<TweezerArray>& tweezer_array3D,
+    double layer_separation_um,
+    byte* phasemap_out
+) {
+    std::vector<double> test;
+    const auto random_vec = generate_random_phase_distribution(random_seed);
+
+    std::vector<double> non_uniformity_vec;
+
+    set_initial_phase_distribution(random_vec.data());
+
+    // Main weighted GS loop
+    // One dark layer between the two bright layers
+    const size_t number_of_layers = tweezer_array3D.size(); // 2 * tweezer_array3D.size() - 1;
+    const double layer_separation_px = layer_separation_um / (1000.0 * slm_pixel_size_mm);
+
+
+    cufftDoubleComplex* in_inverted;
+    double* phasemap_internal;
+    // Allocate
+    {
+        if (cudaSuccess != cudaMallocManaged(&in_inverted, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
+            throw std::runtime_error("init_cuda: Could not allocate in_copy array");
+        }
+        cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+        if (cudaSuccess != cudaMallocManaged(&phasemap_internal,
+            number_of_pixels_padded * number_of_pixels_padded * sizeof(double))) {
+            throw std::runtime_error("init_cuda: Could not allocate phasemap array");
+        }
+        cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+    }
+
+    size_t iteration = 0;
+    for (;;) {
+
+        // 1. Replace with input field
+        substitute_amplitudes_d << <num_blocks_padded, block_size >> >
+            (slm_plane, beam_amplitudes, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
+        cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+
+        substitute_phases_d << <num_blocks_padded, block_size >> >
+            (slm_plane, phasemap_internal, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
+        cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+        if (cudaSuccess != cudaMemset(phasemap_internal, 0,
+            number_of_pixels_padded * number_of_pixels_padded * sizeof(double))) {
+            throw std::runtime_error("AWGS2D_loop: Could not set phasemap_internal array to 0");
+        }
+        cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+        // we could also just iterate over the vector in the for loop
+        // But I am not sure yet if dark layers are needed
+        auto tweezer_array_vec_it = tweezer_array3D.begin();
+
+        for (size_t layer = 0; layer < number_of_layers; layer++) {
+
+            // 2.1 First FFT + FFT of Fresnel propagator
+            cuda_utils::simulate_two_FFTs_in_a_row << <num_blocks_padded, block_size >> >
+                (in_inverted, slm_plane, number_of_pixels_padded, number_of_pixels_padded);
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            // 2.2 Multiply by quadratic phase
+            // It could be that dividing by f^2 is not precise enough for large layer separations, see documentation
+            const double square_phase_factor = math_utils::PI() / wavelength_px * layer_separation_px * layer / pow(focal_length_px, 2.0);
+
+            cuda_utils::multiply_by_quadratic_phase_factor << <num_blocks_padded, block_size >> >
+                (in_inverted, number_of_pixels_padded, square_phase_factor);
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            // 2.3 Inverse FFT
+            if (CUFFT_SUCCESS != cufftExecZ2Z(fft_plan, in_inverted, image_plane, CUFFT_INVERSE)) {
+                throw std::runtime_error("AWGS2D_loop: Could not perform inverse FFT.");
+            }
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            std::vector<double> vec(number_of_pixels_padded * number_of_pixels_padded);
+            std::transform(vec.begin(), vec.end(), image_plane, vec.begin(), [](const auto& v1, auto& v2) {return math_utils::amplitude(v2); });
+            std::stringstream ss;
+            ss << "data/intensity_" << iteration << "_" << layer << ".bmp";
+            basic_fileIO::save_as_bmp(ss.str(), vec.data(), number_of_pixels_padded, number_of_pixels_padded);
+
+            // 3.1
+            tweezer_array_vec_it->update_current_intensities_and_phases(image_plane, false);
+
+            // 3.2 Determine non-uniformity
+            const double delta = tweezer_array_vec_it->get_nonuniformity();
+            std::cout << "Layer " << layer + 1 << " non-uniformity " << 100.0 * delta << "%\n";
+
+            const double mean_intensity = tweezer_array_vec_it->get_mean_intensity();
+            non_uniformity_vec.push_back(delta);
+
+            // 3.3 Weight
+            if (iteration > 0) {
+                const auto intensities = tweezer_array_vec_it->get_intensities();
+                const auto mean_intensity = tweezer_array_vec_it->get_mean_intensity();
+                const auto weights = calculate_weights(intensities, mean_intensity);
+                tweezer_array_vec_it->update_target_intensities(weights);
+            }
+
+            // 3.4 Reset whole out array
+            if (cudaSuccess != cudaMemset(image_plane, 0,
+                number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
+                throw std::runtime_error("AWGS2D_loop: Could not set image_plane array to 0");
+            }
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+
+            // 3.5 Fill values at tweezer sites
+            tweezer_array_vec_it->update_fft_array(image_plane);
+
+            // 4.1 FFT of propagator
+            if (CUFFT_SUCCESS != cufftExecZ2Z(fft_plan, image_plane, in_inverted, CUFFT_FORWARD)) {
+                throw std::runtime_error("AWGS2D_loop: Could not perform FFT.");
+            }
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            // 4.2 Multiply by quadratic phase
+            cuda_utils::multiply_by_quadratic_phase_factor << <num_blocks_padded, block_size >> >
+                (in_inverted, number_of_pixels_padded, -square_phase_factor);
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            // 4.3 Two inverse FFTs
+            cuda_utils::simulate_two_FFTs_in_a_row << <num_blocks_padded, block_size >> >
+                (slm_plane, in_inverted, number_of_pixels_padded, number_of_pixels_padded);
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            extract_phases_d << <num_blocks_padded, block_size >> >
+                (phasemap_internal, slm_plane, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2, true);
+            cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+            basic_fileIO::save_as_bmp("phasemap.bmp", phasemap_internal, number_of_pixels_padded, number_of_pixels_padded);
+
+            std::advance(tweezer_array_vec_it, 1);
+        }
+
+        iteration++;
+        std::cout << iteration << "/" << max_iterations << "\n";
+        if (iteration == max_iterations) {
+            break;
+        }
+    }
+
+    // Fill result in phasemap array so it can be processed in main
+    extract_phases_to_grayscale_d << <num_blocks_padded, block_size >> >
+        (phasemap_out, slm_plane, number_of_pixels_padded, number_of_pixels_unpadded, number_of_pixels_unpadded / 2);
+    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+    basic_fileIO::save_as_bmp("phasemap.bmp", phasemap_out, number_of_pixels_unpadded, number_of_pixels_unpadded);
+
+    cudaFree(in_inverted);
+    cudaFree(phasemap_internal);
+    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+    return test;
 }
 
 
 // Private stuff directly related to the main iterative loop:
 // Note that update_fft_in_array runs on the device and is declared later
-//why is random phase generated by grayscale first??
 void CGHAlgorithm::set_initial_phase_distribution(
     const byte* initial_guess
 ) noexcept {
     double phase;
-    int end_active_area = first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED;
-    //Max added end_active_area;
-    for (size_t i = first_nonzero_index; i < end_active_area; i++) {
-        for (size_t j = first_nonzero_index; j < end_active_area; j++) {
+    for (auto i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (auto j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
             phase = math_utils::grayscale_to_rad(
-                initial_guess[(i - first_nonzero_index) * NUMBER_OF_PIXELS_UNPADDED + (j - first_nonzero_index)]
+                initial_guess[(i - first_nonzero_index) * number_of_pixels_unpadded + (j - first_nonzero_index)]
             );
-            slm_plane[i * NUMBER_OF_PIXELS_PADDED + j].x = 1. / sqrt(2.0) * cos(phase);//constant 1/root2 amplitude?
-            slm_plane[i * NUMBER_OF_PIXELS_PADDED + j].y = 1. / sqrt(2.0) * sin(phase);
+            slm_plane[i * number_of_pixels_padded + j].x = 1. / sqrt(2.0) * cos(phase);
+            slm_plane[i * number_of_pixels_padded + j].y = 1. / sqrt(2.0) * sin(phase);
         }
     }
 }
-
 
 std::vector<byte> CGHAlgorithm::generate_random_phase_distribution(
     int seed
@@ -324,7 +494,7 @@ std::vector<byte> CGHAlgorithm::generate_random_phase_distribution(
     std::default_random_engine generator(seed);
     std::uniform_int_distribution<int> distribution(0, 255);
 
-    std::vector<byte> result(NUMBER_OF_PIXELS_UNPADDED * NUMBER_OF_PIXELS_UNPADDED);
+    std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
 
     std::generate(result.begin(), result.end(), [&] {return (byte)distribution(generator); });
 
@@ -333,9 +503,8 @@ std::vector<byte> CGHAlgorithm::generate_random_phase_distribution(
     return result;
 }
 
-
 std::vector<double> CGHAlgorithm::calculate_weights(
-    std::vector<double> values, double mean
+    const std::vector<double>& values, double mean
 ) const noexcept {
 
     std::vector<double> weights(values.size());
@@ -351,98 +520,26 @@ std::vector<double> CGHAlgorithm::calculate_weights(
     return weights;
 }
 
-
-void CGHAlgorithm::extract_final_phasemap(
-    byte* phasemap
-) const noexcept {
-
-    //why don't you have to shift the slm plane?
-    // Shorter names for better readability of the loop
-
-    const size_t center = first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED / 2;
-    const size_t radius = NUMBER_OF_PIXELS_UNPADDED / 2;
-    const size_t i1 = first_nonzero_index;
-    const size_t N = NUMBER_OF_PIXELS_UNPADDED;
-    const size_t N_padded = NUMBER_OF_PIXELS_PADDED;
-
-    double phase;
-    for (size_t i = i1; i < i1 + N; i++) {
-        for (size_t j = i1; j < i1 + N; j++) {
-            if (math_utils::is_in_circle(j, i, center, center, radius)) {
-                phase = math_utils::phase(slm_plane[i * N_padded + j]);
-                phasemap[(i - i1) * N + (j - i1)]
-                    = math_utils::rad_to_grayscale(phase);
-            }
-            else {
-                phasemap[(i - i1) * N + (j - i1)] = 0;
-            }
-        }
-    }
-}
-
-
-// Copy the unpadded input into the center of the padded input array
-// Similar to pad_array() in cuda_utils, maybe these two can be combined
-//This should probably be updated to use 2D thread using dim() type for kernel call - Max
-static __global__ void update_slm_plane_array(
-    cufftDoubleComplex* __restrict padded_array,
-    const cufftDoubleComplex* __restrict unpadded_array,
-    size_t number_of_pixels_padded, size_t NUMBER_OF_PIXELS_UNPADDED
-) {
-    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
-
-    const unsigned int x = (tid & (number_of_pixels_padded - 1));
-    const unsigned int y = tid / number_of_pixels_padded;
-
-    const unsigned int first_nonzero_index = (number_of_pixels_padded - NUMBER_OF_PIXELS_UNPADDED) / 2;
-
-
-    // Type conversions necessary to allow for negative indices
-    const bool center_site = math_utils::is_in_circle(
-        x, y,
-        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
-        NUMBER_OF_PIXELS_UNPADDED / 2
-    );//shouldn't it not matter if unpadded or padded since unpadded is in middle of padded? -Max
-
-    if (center_site) {
-
-        const unsigned int x_unpadded = x - first_nonzero_index;
-        const unsigned int y_unpadded = y - first_nonzero_index;
-        const double phase = math_utils::phase(padded_array[tid]);
-        const double amp = math_utils::amplitude(unpadded_array[y_unpadded * NUMBER_OF_PIXELS_UNPADDED + x_unpadded]);
-
-
-        padded_array[tid].x = amp * cos(phase);
-        padded_array[tid].y = amp * sin(phase);
-
-    }
-    else {
-        padded_array[tid].x = 0.0;
-        padded_array[tid].y = 0.0;//are you sure? don't we loose info by doing this? - Max
-    }
-}
-
-
 // FileIO. These could be moved into basic_fileIO but for debugging
 // this is easier as they know all the member variables
 void CGHAlgorithm::save_input_intensity_distribution(
     const std::string& filename
 ) const {
     double max = 0.0;
-    for (size_t i = first_nonzero_index; i < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; i++) {
-        for (size_t j = first_nonzero_index; j < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; j++) {
-            if (math_utils::intensity(slm_plane[i * NUMBER_OF_PIXELS_PADDED + j]) > max) {
-                max = math_utils::intensity(slm_plane[i * NUMBER_OF_PIXELS_PADDED + j]);
+    for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            if (math_utils::intensity(slm_plane[i * number_of_pixels_padded + j]) > max) {
+                max = math_utils::intensity(slm_plane[i * number_of_pixels_padded + j]);
             }
         }
     }
     std::vector<byte> result;
-    for (size_t i = first_nonzero_index; i < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; i++) {
-        for (size_t j = first_nonzero_index; j < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; j++) {
-            result.push_back((byte)(255.0 * math_utils::intensity(slm_plane[i * NUMBER_OF_PIXELS_PADDED + j]) / max));
+    for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            result.push_back((byte)(255.0 * math_utils::intensity(slm_plane[i * number_of_pixels_padded + j]) / max));
         }
     }
-    basic_fileIO::save_as_bmp(filename, result.data(), NUMBER_OF_PIXELS_UNPADDED, NUMBER_OF_PIXELS_UNPADDED);
+    basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
     editA->appendMessage("Saved input intensity distribution");
     std::cout << "Saved input intensity distribution\n";
 }
@@ -451,13 +548,13 @@ void CGHAlgorithm::save_input_intensity_distribution(
 void CGHAlgorithm::save_input_phase_distribution(
     const std::string& filename
 ) const {
-    const size_t center = first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED / 2;
-    const size_t radius = NUMBER_OF_PIXELS_UNPADDED / 2;
+    const size_t center = first_nonzero_index + number_of_pixels_unpadded / 2;
+    const size_t radius = number_of_pixels_unpadded / 2;
     const size_t i1 = first_nonzero_index;
-    const size_t N = NUMBER_OF_PIXELS_UNPADDED;
-    const size_t N_padded = NUMBER_OF_PIXELS_PADDED;
+    const size_t N = number_of_pixels_unpadded;
+    const size_t N_padded = number_of_pixels_padded;
 
-    std::vector<byte> result(NUMBER_OF_PIXELS_UNPADDED * NUMBER_OF_PIXELS_UNPADDED);
+    std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
     auto result_it = result.begin();
     double phase;
     for (size_t i = i1; i < i1 + N; i++) {
@@ -467,13 +564,12 @@ void CGHAlgorithm::save_input_phase_distribution(
                 *result_it = math_utils::rad_to_grayscale(phase);
             }
             else {
-                *result_it = 0.0;
+                *result_it = byte(0);
             }
             std::advance(result_it, 1);
         }
     }
-    basic_fileIO::save_as_bmp(filename, result.data(), NUMBER_OF_PIXELS_UNPADDED, NUMBER_OF_PIXELS_UNPADDED);
-    editA->appendMessage("Saved input phase distribution");
+    basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
     std::cout << "Saved input phase distribution\n";
 }
 
@@ -482,7 +578,7 @@ void CGHAlgorithm::save_output_intensity_distribution(
     const std::string& filename
 ) const {
     cufftDoubleComplex* out_shifted;
-    if (cudaSuccess != cudaMallocManaged(&out_shifted, NUMBER_OF_PIXELS_PADDED * NUMBER_OF_PIXELS_PADDED * sizeof(cufftDoubleComplex))) {
+    if (cudaSuccess != cudaMallocManaged(&out_shifted, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
         errBox("save_output_intensity_distribution: Could not allocate out-shifted", __FILE__, __LINE__);
         throw std::runtime_error("save_output_intensity_distribution: Could not allocate out-shifted");
     }
@@ -492,28 +588,26 @@ void CGHAlgorithm::save_output_intensity_distribution(
         throw std::runtime_error("save_output_intensity_distribution: Could not synchronize");
     }
 
-    cuda_utils::fft_shift << <NUM_BLOCKS_PADDED, BLOCK_SIZE >> > (out_shifted, image_plane, NUMBER_OF_PIXELS_PADDED, NUMBER_OF_PIXELS_PADDED);
+    cuda_utils::fft_shift << <num_blocks_padded, block_size >> > (out_shifted, image_plane, number_of_pixels_padded, number_of_pixels_padded);
     if (cudaSuccess != cudaDeviceSynchronize()) {
         errBox("save_output_intensity_distribution: Could not synchronize", __FILE__, __LINE__);
         throw std::runtime_error("save_output_intensity_distribution: Could not synchronize");
     }
     double max = 0.0;
-    double temp;
-    for (size_t i = first_nonzero_index; i < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; i++) {
-        for (size_t j = first_nonzero_index; j < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; j++) {
-            max = (std::max)(max, math_utils::intensity(out_shifted[i * NUMBER_OF_PIXELS_PADDED + j]));
+    for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            max = (std::max)(max, math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]));
         }
     }
-    //Above is necessary since hte GS loop doesn't shift each itteration
 
     // Transform double intensity distribution to grayscale
-    std::vector<byte> result(NUMBER_OF_PIXELS_UNPADDED * NUMBER_OF_PIXELS_UNPADDED);
+    std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
 
     auto result_it = result.begin();
 
-    for (size_t i = first_nonzero_index; i < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; i++) {
-        for (size_t j = first_nonzero_index; j < first_nonzero_index + NUMBER_OF_PIXELS_UNPADDED; j++) {
-            *result_it = (byte)(255.0 * math_utils::intensity(out_shifted[i * NUMBER_OF_PIXELS_PADDED + j]) / max);
+    for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            *result_it = (byte)(255.0 * math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]) / max);
             std::advance(result_it, 1);
         }
     }
@@ -523,7 +617,197 @@ void CGHAlgorithm::save_output_intensity_distribution(
     }
     cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
-    basic_fileIO::save_as_bmp(filename, result.data(), NUMBER_OF_PIXELS_UNPADDED, NUMBER_OF_PIXELS_UNPADDED);
+    basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
     editA->appendMessage("Saved output intensity distribution");
     std::cout << "Saved output intensity distribution\n";
+}
+
+static __global__ void substitute_amplitudes_d(
+    cufftDoubleComplex* __restrict padded_amps_dst,
+    const double* __restrict unpadded_amps_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+) {
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const unsigned int x = tid % number_of_pixels_padded;
+    const unsigned int y = tid / number_of_pixels_padded;
+
+    // Type conversions necessary to allow for negative indices
+    const bool center_site = math_utils::is_in_circle(
+        x, y,
+        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+        center_circle_radius
+    );
+
+    if (center_site) {
+
+        const unsigned int first_nonzero_index = (number_of_pixels_padded - number_of_pixels_unpadded) / 2;
+
+        const unsigned int x_unpadded = x - first_nonzero_index;
+        const unsigned int y_unpadded = y - first_nonzero_index;
+        const double phase = math_utils::phase(padded_amps_dst[tid]);
+        const double amp = unpadded_amps_src[y_unpadded * number_of_pixels_unpadded + x_unpadded];
+
+        padded_amps_dst[tid].x = amp * cos(phase);
+        padded_amps_dst[tid].y = amp * sin(phase);
+
+    }
+    else {
+        padded_amps_dst[tid].x = 0.0;
+        padded_amps_dst[tid].y = 0.0;
+    }
+}
+
+static __global__ void substitute_phases_d(
+    cufftDoubleComplex* __restrict padded_phases_dst,
+    const double* __restrict unpadded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+) {
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const unsigned int x = tid % number_of_pixels_padded;
+    const unsigned int y = tid / number_of_pixels_padded;
+
+    const unsigned int first_nonzero_index = (number_of_pixels_padded - number_of_pixels_unpadded) / 2;
+
+    const bool center_site = math_utils::is_in_circle(
+        x, y,
+        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+        center_circle_radius
+    );
+
+    if (center_site) {
+        const auto x_unpadded = x - first_nonzero_index;
+        const auto y_unpadded = y - first_nonzero_index;
+        const double phase = unpadded_phases_src[y_unpadded * number_of_pixels_unpadded + x_unpadded];
+        const double amp = math_utils::amplitude(padded_phases_dst[tid]);
+
+        padded_phases_dst[tid].x = amp * cos(phase);
+        padded_phases_dst[tid].y = amp * sin(phase);
+    }
+    else {
+        padded_phases_dst[tid].x = 0.0;
+        padded_phases_dst[tid].y = 0.0;
+    }
+}
+
+[[maybe_unused]]
+static __global__ void extract_amplitudes_d(
+    double* __restrict unpadded_amps_dst,
+    const cufftDoubleComplex* __restrict padded_amps_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+) {
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const unsigned int x = tid % number_of_pixels_padded;
+    const unsigned int y = tid / number_of_pixels_padded;
+
+    const unsigned int first_nonzero_index = (number_of_pixels_padded - number_of_pixels_unpadded) / 2;
+
+    const bool center_site = math_utils::is_in_square(
+        x, y,
+        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+        number_of_pixels_unpadded
+    );
+
+    if (center_site) {
+
+        const unsigned int x_unpadded = x - first_nonzero_index;
+        const unsigned int y_unpadded = y - first_nonzero_index;
+
+        const bool center_circle_site = math_utils::is_in_circle(
+            x, y,
+            number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+            center_circle_radius
+        );
+        double val = 0.0;
+        if (center_circle_site) {
+            val = math_utils::phase(padded_amps_src[tid]);
+        }
+        unpadded_amps_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] = val;
+    }
+}
+
+static __global__ void extract_phases_d(
+    double* __restrict unpadded_phases_dst,
+    const cufftDoubleComplex* __restrict padded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius, bool add
+) {
+    const auto tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const int x = tid % number_of_pixels_padded;
+    const int y = tid / number_of_pixels_padded;
+
+    const unsigned int first_nonzero_index = (number_of_pixels_padded - number_of_pixels_unpadded) / 2;
+
+    const bool center_site = math_utils::is_in_square(
+        x, y,
+        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+        number_of_pixels_unpadded
+    );
+
+    if (center_site) {
+
+        const unsigned int x_unpadded = x - first_nonzero_index;
+        const unsigned int y_unpadded = y - first_nonzero_index;
+
+        const bool center_circle_site = math_utils::is_in_circle(
+            x, y,
+            number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+            center_circle_radius
+        );
+        if (center_circle_site) {
+            double val = math_utils::phase(padded_phases_src[tid]);
+            if (add) {
+                unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] += val;
+            }
+            else {
+                unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] = val;
+            }
+        }
+        else {
+            unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] = 0;
+        }
+        // If add is false the value is overwritten otherwise its added
+        // Without if:
+        // unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] = val + add * unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded];
+
+    }
+}
+
+static __global__ void extract_phases_to_grayscale_d(
+    byte* __restrict unpadded_phases_dst,
+    const cufftDoubleComplex* __restrict padded_phases_src,
+    unsigned int number_of_pixels_padded, unsigned int number_of_pixels_unpadded, unsigned int center_circle_radius
+) {
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const unsigned int x = tid % number_of_pixels_padded;
+    const unsigned int y = tid / number_of_pixels_padded;
+
+    const unsigned int first_nonzero_index = (number_of_pixels_padded - number_of_pixels_unpadded) / 2;
+
+    const bool center_site = math_utils::is_in_square(
+        x, y,
+        number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+        number_of_pixels_unpadded
+    );
+
+
+    if (center_site) {
+
+        const unsigned int x_unpadded = x - first_nonzero_index;
+        const unsigned int y_unpadded = y - first_nonzero_index;
+
+        const bool center_circle_site = math_utils::is_in_circle(
+            x, y,
+            number_of_pixels_padded / 2, number_of_pixels_padded / 2,
+            center_circle_radius
+        );
+        byte val = 0;
+        if (center_circle_site) {
+            val = math_utils::rad_to_grayscale(math_utils::phase(padded_phases_src[tid]));
+        }
+        unpadded_phases_dst[y_unpadded * number_of_pixels_unpadded + x_unpadded] = val;
+    }
 }
