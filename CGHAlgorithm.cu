@@ -573,9 +573,8 @@ void CGHAlgorithm::save_input_phase_distribution(
     std::cout << "Saved input phase distribution\n";
 }
 
-
 void CGHAlgorithm::save_output_intensity_distribution(
-    const std::string& filename
+    const std::string& filename, TweezerArray tweezer_array
 ) const {
     cufftDoubleComplex* out_shifted;
     if (cudaSuccess != cudaMallocManaged(&out_shifted, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
@@ -594,6 +593,7 @@ void CGHAlgorithm::save_output_intensity_distribution(
         throw std::runtime_error("save_output_intensity_distribution: Could not synchronize");
     }
     double max = 0.0;
+
     for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
         for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
             max = (std::max)(max, math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]));
@@ -602,7 +602,6 @@ void CGHAlgorithm::save_output_intensity_distribution(
 
     // Transform double intensity distribution to grayscale
     std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
-
     auto result_it = result.begin();
 
     for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
@@ -611,6 +610,7 @@ void CGHAlgorithm::save_output_intensity_distribution(
             std::advance(result_it, 1);
         }
     }
+
     if (cudaSuccess != cudaFree(out_shifted)) {
         errBox("save_output_intensity_distribution: Could not free out_shifted", __FILE__, __LINE__);
         throw std::runtime_error("save_output_intensity_distribution: Could not free out_shifted");
@@ -618,6 +618,68 @@ void CGHAlgorithm::save_output_intensity_distribution(
     cuda_utils::cuda_synchronize(__FILE__, __LINE__);
 
     basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
+    //basic_fileIO::save_as_bmp(filename, result.data(), x_stop - x_start, y_stop - y_start);
+    editA->appendMessage("Saved output intensity distribution");
+    std::cout << "Saved output intensity distribution\n";
+}
+
+void CGHAlgorithm::save_output_intensity_distribution_max(
+    const std::string& filename, TweezerArray tweezer_array
+) const {
+    cufftDoubleComplex* out_shifted;
+    if (cudaSuccess != cudaMallocManaged(&out_shifted, number_of_pixels_padded * number_of_pixels_padded * sizeof(cufftDoubleComplex))) {
+        errBox("save_output_intensity_distribution: Could not allocate out-shifted", __FILE__, __LINE__);
+        throw std::runtime_error("save_output_intensity_distribution: Could not allocate out-shifted");
+    }
+
+    if (cudaSuccess != cudaDeviceSynchronize()) {
+        errBox("save_output_intensity_distribution: Could not synchronize", __FILE__, __LINE__);
+        throw std::runtime_error("save_output_intensity_distribution: Could not synchronize");
+    }
+
+    cuda_utils::fft_shift << <num_blocks_padded, block_size >> > (out_shifted, image_plane, number_of_pixels_padded, number_of_pixels_padded);
+    if (cudaSuccess != cudaDeviceSynchronize()) {
+        errBox("save_output_intensity_distribution: Could not synchronize", __FILE__, __LINE__);
+        throw std::runtime_error("save_output_intensity_distribution: Could not synchronize");
+    }
+    double max = 0.0;
+    int x_start = tweezer_array.get_x_plot_start();
+    int x_stop = tweezer_array.get_x_plot_stop();
+    int y_start = tweezer_array.get_y_plot_start();
+    int y_stop = tweezer_array.get_y_plot_stop();
+
+    for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            max = (std::max)(max, math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]));
+        }
+    }
+
+    // Transform double intensity distribution to grayscale
+    //std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
+    std::vector<byte> result((y_stop - y_start) * (x_stop - x_start));
+    auto result_it = result.begin();
+
+    /*for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
+        for (size_t j = first_nonzero_index; j < first_nonzero_index + number_of_pixels_unpadded; j++) {
+            *result_it = (byte)(255.0 * math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]) / max);
+            std::advance(result_it, 1);
+        }
+    }*/
+    for (size_t i = y_start; i < y_stop; i++) {
+        for (size_t j = x_start; j < x_stop; j++) {
+            *result_it = (byte)(255.0 * math_utils::intensity(out_shifted[i * number_of_pixels_padded + j]) / max);
+            std::advance(result_it, 1);
+        }
+    }
+
+    if (cudaSuccess != cudaFree(out_shifted)) {
+        errBox("save_output_intensity_distribution: Could not free out_shifted", __FILE__, __LINE__);
+        throw std::runtime_error("save_output_intensity_distribution: Could not free out_shifted");
+    }
+    cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+    //basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
+    basic_fileIO::save_as_bmp(filename, result.data(), x_stop - x_start, y_stop - y_start);
     editA->appendMessage("Saved output intensity distribution");
     std::cout << "Saved output intensity distribution\n";
 }

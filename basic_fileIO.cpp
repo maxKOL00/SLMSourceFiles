@@ -57,7 +57,7 @@ namespace basic_fileIO {
 		out.close();
 		if (!out) {
 			errBox("save_as_bmp: File still open", __FILE__, __LINE__);
-			throw std::runtime_error("save_as_bmp: File still open");
+			//throw std::runtime_error("save_as_bmp: File still open");
 		}
 
 	}

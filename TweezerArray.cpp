@@ -307,6 +307,28 @@ std::vector<double> TweezerArray::calculate_gaussian_weights(
     return gaussian_weights;
 }
 
+void TweezerArray::update_plot_positions(int center, int spacing_x_px, int offset_x,
+                                         int spacing_y_px, int offset_y) {
+    if (num_traps_x & 1) {
+        x_start_plot = center - 20 - (((num_traps_x - 1) / 2) * spacing_x_px);
+        x_stop_plot = center + 20 + (((num_traps_x - 1) / 2) * spacing_x_px);
+    }
+    else{ x_start_plot = center - 20 - (((num_traps_x - 1) / 2) * spacing_x_px) + (spacing_x_px / 2);
+        x_stop_plot = center + 20 + (((num_traps_x - 1) / 2) * spacing_x_px) + (spacing_x_px / 2);
+    }
+    if (num_traps_y & 1) {
+        y_start_plot = center - 20 - (((num_traps_y - 1) / 2) * spacing_y_px);
+        y_stop_plot = center + 20 + (((num_traps_y - 1) / 2) * spacing_y_px);
+    }
+    else { y_start_plot = center - 20 - (((num_traps_y - 1) / 2) * spacing_y_px) - (spacing_y_px / 2);
+        y_stop_plot = center + 20 + (((num_traps_y - 1) / 2) * spacing_y_px) + (spacing_y_px / 2);
+    }
+    if (y_start_plot < 0) { y_start_plot = 0; }
+    if (x_start_plot < 0) { x_start_plot = 0; }
+    if (x_stop_plot > number_of_pixels_unpadded) { x_stop_plot = number_of_pixels_unpadded; }
+    if (y_stop_plot > number_of_pixels_unpadded) { y_stop_plot = number_of_pixels_unpadded; }
+
+}
 
 // Different lattice types
 void TweezerArray::generate_rectangular_lattice(
@@ -325,6 +347,11 @@ void TweezerArray::generate_rectangular_lattice(
     const int y_upper = (int)(num_traps_y) / 2 + (int)(num_traps_y % 2);
     const int x_lower = -(int)(num_traps_x) / 2;
     const int x_upper = (int)(num_traps_x) / 2 + (int)(num_traps_x % 2);
+
+    /// <summary>
+    update_plot_positions(center, spacing_x_px, offset_x,spacing_y_px, offset_y);
+
+    ///
 
     auto tweezer_vec_it = tweezer_vec.begin();
     int index_x, index_y;

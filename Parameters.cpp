@@ -205,6 +205,7 @@ unsigned int Parameters::get_first_nonzero_index() const {
     return (get_number_of_pixels_padded() - get_number_of_pixels_unpadded()) / 2;
 }
 
+
 int Parameters::get_random_seed() const {
     return config.at("TWEEZER_ARRAY_GENERATION").at("RANDOM_SEED");
 }
