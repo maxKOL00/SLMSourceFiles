@@ -2,10 +2,23 @@
 
 namespace fs = std::filesystem;
 
-Parameters::Parameters() {
-    std::ifstream config_fstream("config.json");
+//Parameters::Parameters() {
+//    std::ifstream config_fstream("config.json");
+//    if (!config_fstream.is_open()) {
+//        throw std::runtime_error("Could not open config.json");
+//    }
+//    config_fstream >> config;
+//    config_fstream.close();
+//
+//}
+
+Parameters::Parameters(std::string filename) {
+    std::ifstream config_fstream(filename);
     if (!config_fstream.is_open()) {
-        throw std::runtime_error("Could not open config.json");
+        config_fstream.open("config.json");
+        if (!config_fstream.is_open()) {
+            throw std::runtime_error("Could not open config.json");
+        }
     }
     config_fstream >> config;
     config_fstream.close();
