@@ -13,7 +13,7 @@ namespace fs = std::filesystem;
 //}
 
 Parameters::Parameters(std::string filename) {
-    std::ifstream config_fstream(filename);
+    std::ifstream config_fstream("configFiles/" + filename);
     if (!config_fstream.is_open()) {
         config_fstream.open("config.json");
         if (!config_fstream.is_open()) {
@@ -84,6 +84,10 @@ unsigned int Parameters::get_horizontal_offset() const {
 
 unsigned int Parameters::get_grating_period_px() const {
     return config.at("CALIBRATION").at("GRATING_PERIOD_PX");
+}
+
+unsigned int Parameters::get_grating_diff() const {
+    return config.at("CALIBRATION").at("GRATING_DIFF");
 }
 
 byte Parameters::get_blazed_grating_max() const {
