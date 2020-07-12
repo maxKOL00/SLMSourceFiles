@@ -112,7 +112,7 @@ namespace basic_fileIO {
 		ifile.close();
 	}
 
-	/*std::string create_filepath(
+	std::string create_filepath(
 		const std::string& filename, const std::string& folder
 	) {
 		std::string filepath;
@@ -135,7 +135,7 @@ namespace basic_fileIO {
 		}
 		errBox("create_filepath: Could not create directory", __FILE__, __LINE__);
 		throw std::runtime_error("create_filepath: Could not create directory");
-	}*/
+	}
 
 	//void create_nested_directory(
 	//	const std::string& filepath
@@ -217,4 +217,7 @@ namespace basic_fileIO {
 		}
 	}
 
+
+
 }
+

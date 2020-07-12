@@ -37,7 +37,7 @@ void init_window(const Parameters& params) {
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
     //glutInitWindowSize(width, height);
     glutCreateWindow("SLM Image");
-    glutPositionWindow(2600, 0);
+    glutPositionWindow(3840, 0);
 
     glutDisplayFunc(display);
     glEnable(GL_TEXTURE_2D);

@@ -313,7 +313,7 @@ void TweezerArray::update_plot_positions(int center, int spacing_x_px, int offse
         x_start_plot = center - 20 - (((num_traps_x - 1) / 2) * spacing_x_px);
         x_stop_plot = center + 20 + (((num_traps_x - 1) / 2) * spacing_x_px);
     }
-    else{ x_start_plot = center - 20 - (((num_traps_x - 1) / 2) * spacing_x_px) + (spacing_x_px / 2);
+    else{ x_start_plot = center - 20 - (((num_traps_x - 1) / 2) * spacing_x_px) - (spacing_x_px / 2);
         x_stop_plot = center + 20 + (((num_traps_x - 1) / 2) * spacing_x_px) + (spacing_x_px / 2);
     }
     if (num_traps_y & 1) {
@@ -325,8 +325,8 @@ void TweezerArray::update_plot_positions(int center, int spacing_x_px, int offse
     }
     if (y_start_plot < 0) { y_start_plot = 0; }
     if (x_start_plot < 0) { x_start_plot = 0; }
-    if (x_stop_plot > number_of_pixels_unpadded) { x_stop_plot = number_of_pixels_unpadded; }
-    if (y_stop_plot > number_of_pixels_unpadded) { y_stop_plot = number_of_pixels_unpadded; }
+    if (x_stop_plot > ((number_of_pixels_unpadded/2)+center)) { x_stop_plot = number_of_pixels_unpadded; }
+    if (y_stop_plot > ((number_of_pixels_unpadded / 2) + center)) { y_stop_plot = number_of_pixels_unpadded; }
 
 }
 

@@ -654,9 +654,22 @@ void CGHAlgorithm::save_output_intensity_distribution_max(
         }
     }
 
+    switch ((x_stop - x_start) % 4) {
+        case 0:
+            break;
+        case 1:
+            x_stop += 3;
+            break;
+        case 2: 
+            x_stop += 2;
+            break;
+        case 3:
+            x_stop += 1;
+            break;
+    }
     // Transform double intensity distribution to grayscale
     //std::vector<byte> result(number_of_pixels_unpadded * number_of_pixels_unpadded);
-    std::vector<byte> result((y_stop - y_start) * (x_stop - x_start));
+    std::vector<byte> result((y_stop - y_start) * (x_stop - x_start), 0);
     auto result_it = result.begin();
 
     /*for (size_t i = first_nonzero_index; i < first_nonzero_index + number_of_pixels_unpadded; i++) {
@@ -677,6 +690,8 @@ void CGHAlgorithm::save_output_intensity_distribution_max(
         throw std::runtime_error("save_output_intensity_distribution: Could not free out_shifted");
     }
     cuda_utils::cuda_synchronize(__FILE__, __LINE__);
+
+
 
     //basic_fileIO::save_as_bmp(filename, result.data(), number_of_pixels_unpadded, number_of_pixels_unpadded);
     basic_fileIO::save_as_bmp(filename, result.data(), x_stop - x_start, y_stop - y_start);
